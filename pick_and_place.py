@@ -6,18 +6,17 @@ commands (no motion planner):
     START (above pick) -> PICK -> grab -> lift back up ->
     above place -> PLACE -> release -> retreat up
 
-    START_POSE      gripper open, positioned directly above the object
-    PICK_POSE       gripper closes here to grab the object
-    PLACE_POSE      where the object is released
-    PLACE_APPROACH  directly above PLACE, so the arm lowers/lifts vertically
+Waypoints are derived from the pick pose: START/lift is START_HEIGHT above
+PICK, PLACE is PLACE_LEFT_OFFSET to the side, and the place approach is
+START_HEIGHT above PLACE. Lifting the object before moving sideways keeps it
+clear of the surface, and approaching each pose from directly above keeps the
+vertical segments roughly straight down.
 
-Each step is a direct `move_to_position`. Lifting the object before moving
-sideways keeps it clear of the surface, and approaching each pose from
-directly above keeps the vertical segments roughly straight down.
+The core motion lives in `execute_pick_place(arm, gripper, pick_pose)` so other
+scripts (e.g. detect_and_pick.py) can reuse it with a different pick pose.
 
 Credentials and resource names come from environment variables (see
-`.env.example`). START and PLACE are derived from the measured PICK pose
-below. Run:
+`.env.example`). Run:
 
     python pick_and_place.py
 """
@@ -65,15 +64,8 @@ SETTLE_SECONDS = 1.0
 CLAMP_SECONDS = 1.5
 
 # PICK is your measured grasp point (z 214.7491), lowered 2 mm so the gripper
-# reaches down far enough to grab the object. Everything else is derived from
-# PICK, so START and PLACE follow this height automatically.
+# reaches down far enough to grab the object.
 PICK_POSE = Pose(x=472.0814, y=7.3932, z=212.7491, **GRASP)
-# Waypoint directly above PICK: both the start position and the lift target.
-START_POSE = Pose(x=PICK_POSE.x, y=PICK_POSE.y, z=PICK_POSE.z + START_HEIGHT, **GRASP)
-# Drop location, 25 mm to the left of PICK at the same height.
-PLACE_POSE = Pose(x=PICK_POSE.x, y=PICK_POSE.y + PLACE_LEFT_OFFSET, z=PICK_POSE.z, **GRASP)
-# Waypoint directly above PLACE: approached before lowering, retreated to after.
-PLACE_APPROACH = Pose(x=PLACE_POSE.x, y=PLACE_POSE.y, z=PLACE_POSE.z + START_HEIGHT, **GRASP)
 
 
 def connect_options() -> "RobotClient.Options":
@@ -96,25 +88,43 @@ def connect_options() -> "RobotClient.Options":
     return RobotClient.Options.with_api_key(api_key=API_KEY, api_key_id=API_KEY_ID)
 
 
+def offset_pose(pose: Pose, *, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> Pose:
+    """Return a copy of `pose` shifted by (dx, dy, dz) mm, keeping orientation."""
+    return Pose(
+        x=pose.x + dx,
+        y=pose.y + dy,
+        z=pose.z + dz,
+        o_x=pose.o_x,
+        o_y=pose.o_y,
+        o_z=pose.o_z,
+        theta=pose.theta,
+    )
+
+
 async def move_to(arm: Arm, pose: Pose, label: str) -> None:
     """Move the arm's end effector to `pose`."""
     LOGGER.info("Moving to %s: x=%.1f y=%.1f z=%.1f", label, pose.x, pose.y, pose.z)
     await arm.move_to_position(pose)
 
 
-async def pick_and_place(arm: Arm, gripper: Gripper) -> None:
-    """Run one pick-and-place cycle with a lift between pick and place.
+async def execute_pick_place(arm: Arm, gripper: Gripper, pick_pose: Pose) -> None:
+    """Run one lift-before-shift pick-and-place cycle, picking at `pick_pose`.
 
-    START (above pick) -> PICK -> grab -> lift back to START ->
-    PLACE_APPROACH (above place) -> PLACE -> release -> retreat.
-    Lifting before moving sideways keeps the object clear of the surface.
+    Derived waypoints (orientation is inherited from `pick_pose`):
+        start / lift   = pick_pose raised by START_HEIGHT
+        place          = pick_pose shifted by PLACE_LEFT_OFFSET in y
+        place_approach = place raised by START_HEIGHT
     """
+    start = offset_pose(pick_pose, dz=START_HEIGHT)
+    place = offset_pose(pick_pose, dy=PLACE_LEFT_OFFSET)
+    place_approach = offset_pose(place, dz=START_HEIGHT)
+
     LOGGER.info("Opening gripper")
     await gripper.open()
 
     # Descend onto the object and grab it.
-    await move_to(arm, START_POSE, "START (above pick)")
-    await move_to(arm, PICK_POSE, "PICK")
+    await move_to(arm, start, "START (above pick)")
+    await move_to(arm, pick_pose, "PICK")
 
     # Let the arm come fully to rest before closing, so it is not still moving
     # when the gripper tries to grasp the object.
@@ -131,17 +141,17 @@ async def pick_and_place(arm: Arm, gripper: Gripper) -> None:
     await asyncio.sleep(CLAMP_SECONDS)
 
     # Lift straight up so the object clears the surface before moving sideways.
-    await move_to(arm, START_POSE, "LIFT (above pick)")
+    await move_to(arm, start, "LIFT (above pick)")
 
     # Travel over the place location at height, then lower onto it.
-    await move_to(arm, PLACE_APPROACH, "APPROACH (above place)")
-    await move_to(arm, PLACE_POSE, "PLACE")
+    await move_to(arm, place_approach, "APPROACH (above place)")
+    await move_to(arm, place, "PLACE")
 
     LOGGER.info("Opening gripper to release the object")
     await gripper.open()
 
     # Retreat up so the gripper clears the placed object.
-    await move_to(arm, PLACE_APPROACH, "RETREAT (above place)")
+    await move_to(arm, place_approach, "RETREAT (above place)")
 
     LOGGER.info("Pick-and-place complete")
 
@@ -152,7 +162,7 @@ async def main() -> None:
         LOGGER.info("Connected. Available resources: %s", machine.resource_names)
         arm = Arm.from_robot(machine, ARM_NAME)
         gripper = Gripper.from_robot(machine, GRIPPER_NAME)
-        await pick_and_place(arm, gripper)
+        await execute_pick_place(arm, gripper, PICK_POSE)
     finally:
         await machine.close()
 
