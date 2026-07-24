@@ -1,16 +1,25 @@
-"""Basic pick-and-place example for the Viam Python SDK.
+"""Simple pick-and-place for the Viam Python SDK.
 
-The robot picks an object from one location and places it at another.
-Motion is planned through the Viam `motion` service so the arm avoids
-collisions with obstacles you declare in the world state (e.g. the table).
+Moves the arm through a lift-before-shift pick-and-place with direct arm
+commands (no motion planner):
 
-Configure your machine's API key, address, and component names via
-environment variables (see `.env.example`), then run:
+    START (above pick) -> PICK -> grab -> lift back up ->
+    above place -> PLACE -> release -> retreat up
+
+    START_POSE      gripper open, positioned directly above the object
+    PICK_POSE       gripper closes here to grab the object
+    PLACE_POSE      where the object is released
+    PLACE_APPROACH  directly above PLACE, so the arm lowers/lifts vertically
+
+Each step is a direct `move_to_position`. Lifting the object before moving
+sideways keeps it clear of the surface, and approaching each pose from
+directly above keeps the vertical segments roughly straight down.
+
+Credentials and resource names come from environment variables (see
+`.env.example`). START and PLACE are derived from the measured PICK pose
+below. Run:
 
     python pick_and_place.py
-
-Requires an arm, a gripper, and the built-in motion service configured on
-your machine. Update the pick/place poses below to match your workspace.
 """
 
 import asyncio
@@ -19,48 +28,45 @@ import os
 from viam.components.arm import Arm
 from viam.components.gripper import Gripper
 from viam.logging import getLogger
-from viam.proto.common import (
-    Geometry,
-    GeometriesInFrame,
-    Pose,
-    PoseInFrame,
-    RectangularPrism,
-    Vector3,
-    WorldState,
-)
+from viam.proto.common import Pose
 from viam.robot.client import RobotClient
-from viam.services.motion import MotionClient
 
 LOGGER = getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Credentials (from your machine's CONNECT tab in the Viam app)
 # ---------------------------------------------------------------------------
-# Credentials come from environment variables so they never live in source.
-# Get these from your machine's CONNECT tab in the Viam app.
 API_KEY = os.environ.get("VIAM_API_KEY", "")
 API_KEY_ID = os.environ.get("VIAM_API_KEY_ID", "")
 MACHINE_ADDRESS = os.environ.get("VIAM_MACHINE_ADDRESS", "")
 
 # Resource names as configured on your machine.
-ARM_NAME = os.environ.get("VIAM_ARM_NAME", "arm")
-GRIPPER_NAME = os.environ.get("VIAM_GRIPPER_NAME", "gripper")
-MOTION_NAME = os.environ.get("VIAM_MOTION_NAME", "builtin")
+ARM_NAME = os.environ.get("VIAM_ARM_NAME", "arm-1")
+GRIPPER_NAME = os.environ.get("VIAM_GRIPPER_NAME", "gripper-1")
 
-# All positions are in millimeters, relative to the "world" reference frame.
-# Orientation is a Viam orientation vector; (o_x, o_y, o_z) = (0, 0, -1) points
-# the gripper straight down, which is the usual approach for top-down picking.
-#
-# ⚠️  These are placeholder coordinates. Measure your own workspace and update
-# them before running against real hardware, or you risk driving the arm into
-# something.
-GRIPPER_DOWN = {"o_x": 0.0, "o_y": 0.0, "o_z": -1.0, "theta": 0.0}
+# ---------------------------------------------------------------------------
+# Poses  (positions in millimeters, in the arm's base frame)
+# ---------------------------------------------------------------------------
+# Orientation captured at the grasp point. The gripper points nearly straight
+# down; note this is ~10 deg off true vertical (o_x = -0.17), which is your
+# real measured orientation. For mathematically straight down, instead use
+# {"o_x": 0.0, "o_y": 0.0, "o_z": -1.0, "theta": 0.0}.
+GRASP = {"o_x": -0.17446, "o_y": -0.00274, "o_z": -0.98466, "theta": -179.8715}
 
-PICK_POSE = Pose(x=400.0, y=0.0, z=100.0, **GRIPPER_DOWN)
-PLACE_POSE = Pose(x=400.0, y=300.0, z=100.0, **GRIPPER_DOWN)
+# START sits this far directly above PICK; PLACE is offset sideways (mm).
+START_HEIGHT = 200.0
+PLACE_LEFT_OFFSET = 25.0  # +y = left in the arm base frame; flip to -25.0 if
+# the arm moves the wrong direction
 
-# How far above pick/place poses to approach from and retreat to (mm).
-APPROACH_HEIGHT = 100.0
+# PICK is your measured grasp point. Everything else is derived from it so the
+# relationships stay correct if you edit PICK.
+PICK_POSE = Pose(x=472.0814, y=7.3932, z=214.7491, **GRASP)
+# Waypoint directly above PICK: both the start position and the lift target.
+START_POSE = Pose(x=PICK_POSE.x, y=PICK_POSE.y, z=PICK_POSE.z + START_HEIGHT, **GRASP)
+# Drop location, 25 mm to the left of PICK at the same height.
+PLACE_POSE = Pose(x=PICK_POSE.x, y=PICK_POSE.y + PLACE_LEFT_OFFSET, z=PICK_POSE.z, **GRASP)
+# Waypoint directly above PLACE: approached before lowering, retreated to after.
+PLACE_APPROACH = Pose(x=PLACE_POSE.x, y=PLACE_POSE.y, z=PLACE_POSE.z + START_HEIGHT, **GRASP)
 
 
 def connect_options() -> "RobotClient.Options":
@@ -83,100 +89,54 @@ def connect_options() -> "RobotClient.Options":
     return RobotClient.Options.with_api_key(api_key=API_KEY, api_key_id=API_KEY_ID)
 
 
-def build_world_state() -> WorldState:
-    """Declare static obstacles so the motion planner avoids them.
+async def move_to(arm: Arm, pose: Pose, label: str) -> None:
+    """Move the arm's end effector to `pose`."""
+    LOGGER.info("Moving to %s: x=%.1f y=%.1f z=%.1f", label, pose.x, pose.y, pose.z)
+    await arm.move_to_position(pose)
 
-    Here we model the table as a flat box just below the workspace. Add more
-    geometries (bins, walls, fixtures) to reflect your real environment.
+
+async def pick_and_place(arm: Arm, gripper: Gripper) -> None:
+    """Run one pick-and-place cycle with a lift between pick and place.
+
+    START (above pick) -> PICK -> grab -> lift back to START ->
+    PLACE_APPROACH (above place) -> PLACE -> release -> retreat.
+    Lifting before moving sideways keeps the object clear of the surface.
     """
-    table = Geometry(
-        center=Pose(x=400.0, y=150.0, z=-10.0, o_x=0.0, o_y=0.0, o_z=1.0, theta=0.0),
-        box=RectangularPrism(dims_mm=Vector3(x=1000.0, y=1000.0, z=20.0)),
-        label="table",
-    )
-    obstacles = GeometriesInFrame(reference_frame="world", geometries=[table])
-    return WorldState(obstacles=[obstacles])
-
-
-def above(pose: Pose, height: float) -> Pose:
-    """Return a copy of `pose` raised by `height` mm along z."""
-    return Pose(
-        x=pose.x,
-        y=pose.y,
-        z=pose.z + height,
-        o_x=pose.o_x,
-        o_y=pose.o_y,
-        o_z=pose.o_z,
-        theta=pose.theta,
-    )
-
-
-async def move_arm_to(
-    motion: MotionClient,
-    arm_resource_name,
-    pose: Pose,
-    world_state: WorldState,
-    description: str,
-) -> None:
-    """Plan and execute a collision-free move of the arm to `pose`."""
-    LOGGER.info("Moving arm to %s: %s", description, pose)
-    destination = PoseInFrame(reference_frame="world", pose=pose)
-    moved = await motion.move(
-        component_name=arm_resource_name,
-        destination=destination,
-        world_state=world_state,
-    )
-    if not moved:
-        raise RuntimeError(f"Motion planner failed to move arm to {description}")
-
-
-async def pick_and_place(
-    motion: MotionClient,
-    gripper: Gripper,
-    world_state: WorldState,
-) -> None:
-    """Run one full pick-and-place cycle."""
-    arm_resource_name = Arm.get_resource_name(ARM_NAME)
-
-    pick_approach = above(PICK_POSE, APPROACH_HEIGHT)
-    place_approach = above(PLACE_POSE, APPROACH_HEIGHT)
-
-    # --- Pick ---
-    LOGGER.info("Opening gripper before pick")
+    LOGGER.info("Opening gripper")
     await gripper.open()
 
-    await move_arm_to(motion, arm_resource_name, pick_approach, world_state, "pick approach")
-    await move_arm_to(motion, arm_resource_name, PICK_POSE, world_state, "pick pose")
+    # Descend onto the object and grab it.
+    await move_to(arm, START_POSE, "START (above pick)")
+    await move_to(arm, PICK_POSE, "PICK")
 
-    LOGGER.info("Grabbing object")
+    LOGGER.info("Closing gripper to grab the object")
     grabbed = await gripper.grab()
     if not grabbed:
-        LOGGER.warning("Gripper reported it did not grab anything")
+        LOGGER.warning("Gripper did not report a successful grab")
 
-    await move_arm_to(motion, arm_resource_name, pick_approach, world_state, "pick retreat")
+    # Lift straight up so the object clears the surface before moving sideways.
+    await move_to(arm, START_POSE, "LIFT (above pick)")
 
-    # --- Place ---
-    await move_arm_to(motion, arm_resource_name, place_approach, world_state, "place approach")
-    await move_arm_to(motion, arm_resource_name, PLACE_POSE, world_state, "place pose")
+    # Travel over the place location at height, then lower onto it.
+    await move_to(arm, PLACE_APPROACH, "APPROACH (above place)")
+    await move_to(arm, PLACE_POSE, "PLACE")
 
-    LOGGER.info("Releasing object")
+    LOGGER.info("Opening gripper to release the object")
     await gripper.open()
 
-    await move_arm_to(motion, arm_resource_name, place_approach, world_state, "place retreat")
+    # Retreat up so the gripper clears the placed object.
+    await move_to(arm, PLACE_APPROACH, "RETREAT (above place)")
 
-    LOGGER.info("Pick-and-place cycle complete")
+    LOGGER.info("Pick-and-place complete")
 
 
 async def main() -> None:
     machine = await RobotClient.at_address(MACHINE_ADDRESS, connect_options())
     try:
         LOGGER.info("Connected. Available resources: %s", machine.resource_names)
-
+        arm = Arm.from_robot(machine, ARM_NAME)
         gripper = Gripper.from_robot(machine, GRIPPER_NAME)
-        motion = MotionClient.from_robot(machine, MOTION_NAME)
-        world_state = build_world_state()
-
-        await pick_and_place(motion, gripper, world_state)
+        await pick_and_place(arm, gripper)
     finally:
         await machine.close()
 
