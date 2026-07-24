@@ -16,7 +16,12 @@ The core motion lives in `execute_pick_place(arm, gripper, pick_pose)` so other
 scripts (e.g. detect_and_pick.py) can reuse it with a different pick pose.
 
 Credentials and resource names come from environment variables (see
-`.env.example`). Run:
+`.env.example`). `connect()` lives here too, and is shared with
+detect_and_pick.py: set VIAM_LOCAL_ADDRESS to dial the machine directly rather
+than relaying through the cloud, which is what you want when running on the
+device that hosts viam-server.
+
+Run:
 
     python pick_and_place.py
 """
@@ -29,6 +34,7 @@ from viam.components.gripper import Gripper
 from viam.logging import getLogger
 from viam.proto.common import Pose
 from viam.robot.client import RobotClient
+from viam.rpc.dial import DialOptions
 
 LOGGER = getLogger(__name__)
 
@@ -37,7 +43,29 @@ LOGGER = getLogger(__name__)
 # ---------------------------------------------------------------------------
 API_KEY = os.environ.get("VIAM_API_KEY", "")
 API_KEY_ID = os.environ.get("VIAM_API_KEY_ID", "")
+
+# Cloud address of the machine. Traffic is relayed through Viam's servers over
+# WebRTC: convenient from a laptop, but large payloads get split across many
+# data-channel messages.
 MACHINE_ADDRESS = os.environ.get("VIAM_MACHINE_ADDRESS", "")
+
+# Set this to dial the machine directly over gRPC instead of relaying through
+# the cloud. Running on the same device as viam-server, that is its default
+# bind address, "localhost:8080"; from elsewhere on the LAN, use the machine's
+# local address from the CONNECT tab. Include the port either way, or the SDK
+# assumes 443.
+#
+# This matters most for perception: a 640x480 depth frame is ~600 KB, big
+# enough that WebRTC chunking makes it arrive late or incomplete under load.
+# A direct connection delivers the frame in one piece.
+LOCAL_ADDRESS = os.environ.get("VIAM_LOCAL_ADDRESS", "")
+
+# viam-server normally serves TLS even locally, and the SDK skips certificate
+# verification for localhost, so the default works as-is. Set this only if a
+# local connection fails with InsecureConnectionError, which means your server
+# is serving plain HTTP/2; it lets the SDK fall back to an unencrypted
+# connection, which also sends the API key in the clear.
+LOCAL_ALLOW_INSECURE = os.environ.get("VIAM_LOCAL_INSECURE", "0") == "1"
 
 # Resource names as configured on your machine.
 ARM_NAME = os.environ.get("VIAM_ARM_NAME", "arm-1")
@@ -68,24 +96,47 @@ CLAMP_SECONDS = 1.5
 PICK_POSE = Pose(x=472.0814, y=7.3932, z=212.7491, **GRASP)
 
 
+def machine_address() -> str:
+    """The address to dial: the local one if set, otherwise the cloud one."""
+    return LOCAL_ADDRESS or MACHINE_ADDRESS
+
+
 def connect_options() -> "RobotClient.Options":
     """Build connection options, failing early if credentials are missing."""
     missing = [
         name
-        for name, value in (
-            ("VIAM_API_KEY", API_KEY),
-            ("VIAM_API_KEY_ID", API_KEY_ID),
-            ("VIAM_MACHINE_ADDRESS", MACHINE_ADDRESS),
-        )
+        for name, value in (("VIAM_API_KEY", API_KEY), ("VIAM_API_KEY_ID", API_KEY_ID))
         if not value
     ]
+    if not machine_address():
+        missing.append("VIAM_MACHINE_ADDRESS (or VIAM_LOCAL_ADDRESS)")
     if missing:
         raise SystemExit(
             "Missing required environment variables: "
             + ", ".join(missing)
             + "\nSee .env.example and set them before running."
         )
-    return RobotClient.Options.with_api_key(api_key=API_KEY, api_key_id=API_KEY_ID)
+
+    dial_options = DialOptions.with_api_key(api_key=API_KEY, api_key_id=API_KEY_ID)
+    if LOCAL_ADDRESS:
+        # Dial the machine's gRPC endpoint directly: no signaling, no relay,
+        # and no chunking of large frames.
+        dial_options.disable_webrtc = True
+        # TLS is still attempted first; this only permits the fallback.
+        dial_options.allow_insecure_with_creds_downgrade = LOCAL_ALLOW_INSECURE
+    return RobotClient.Options(dial_options=dial_options)
+
+
+async def connect() -> RobotClient:
+    """Connect to the machine, directly if VIAM_LOCAL_ADDRESS is set."""
+    options = connect_options()
+    address = machine_address()
+    LOGGER.info(
+        "Connecting to %s (%s)",
+        address,
+        "direct gRPC" if LOCAL_ADDRESS else "cloud relay over WebRTC",
+    )
+    return await RobotClient.at_address(address, options)
 
 
 def offset_pose(pose: Pose, *, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> Pose:
@@ -157,7 +208,7 @@ async def execute_pick_place(arm: Arm, gripper: Gripper, pick_pose: Pose) -> Non
 
 
 async def main() -> None:
-    machine = await RobotClient.at_address(MACHINE_ADDRESS, connect_options())
+    machine = await connect()
     try:
         LOGGER.info("Connected. Available resources: %s", machine.resource_names)
         arm = Arm.from_robot(machine, ARM_NAME)

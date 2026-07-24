@@ -50,6 +50,28 @@ set -a; source .env; set +a
 python pick_and_place.py
 ```
 
+## Run on the machine itself
+
+By default the scripts connect through `VIAM_MACHINE_ADDRESS`, which relays traffic through Viam's servers over WebRTC.
+That is fine for arm commands, but WebRTC splits large payloads across many data-channel messages, and a 640x480 depth frame is around 600 KB.
+Under load those frames arrive late, truncated, or not at all, which shows up as unreliable depth in `detect_and_pick.py`.
+
+Running the script on the same device as `viam-server` removes the relay entirely.
+Copy this directory to that device, install the requirements there, and set `VIAM_LOCAL_ADDRESS` to `viam-server`'s bind address:
+
+```bash
+VIAM_LOCAL_ADDRESS=localhost:8080 python detect_and_pick.py
+```
+
+When `VIAM_LOCAL_ADDRESS` is set it takes precedence over `VIAM_MACHINE_ADDRESS`, and the SDK dials gRPC directly instead of negotiating WebRTC.
+You still need `VIAM_API_KEY` and `VIAM_API_KEY_ID`: a local connection is authenticated the same way as a remote one.
+
+Notes:
+
+- Always include the port. Without one the SDK assumes 443, while `viam-server` binds `8080` by default.
+- The same variable works from any other host on the machine's LAN. Use the machine's local address from the CONNECT tab (it ends in `.local.viam.cloud`) rather than `localhost`.
+- If the connection fails with `InsecureConnectionError`, your `viam-server` is serving plain HTTP/2 at that address. Set `VIAM_LOCAL_INSECURE=1` to allow the fallback, keeping in mind it sends your API key unencrypted.
+
 ## Configure for your workspace
 
 The pick and place coordinates in `pick_and_place.py` are **placeholders**.

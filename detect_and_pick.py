@@ -29,22 +29,21 @@ Pick a specific class:    VIAM_TARGET_CLASS=gear python detect_and_pick.py
 import asyncio
 import os
 import statistics
+import time
 
 from viam.components.arm import Arm
 from viam.components.camera import Camera
 from viam.components.gripper import Gripper
 from viam.logging import getLogger
 from viam.proto.common import Pose, PoseInFrame
-from viam.robot.client import RobotClient
 from viam.services.vision import VisionClient
 
 from pick_and_place import (
     ARM_NAME,
     GRASP,
     GRIPPER_NAME,
-    MACHINE_ADDRESS,
     PICK_POSE,
-    connect_options,
+    connect,
     execute_pick_place,
 )
 
@@ -81,14 +80,63 @@ USE_DEPTH_Z = os.environ.get("VIAM_USE_DEPTH_Z", "0") == "1"
 # pixels) so one bad pixel does not throw off the position.
 DEPTH_WINDOW_HALF = 3
 
-# The remote link occasionally drops large payloads (depth frames); retry.
-RETRIES = 3
-RETRY_DELAY_S = 1.0
+# The depth source to request and match. get_images() would otherwise also
+# return the color frame, which we never use; asking for depth only roughly
+# halves the payload. Override if your camera's depth stream is named differently.
+DEPTH_SOURCE = os.environ.get("VIAM_DEPTH_SOURCE", "depth")
+
+# Depth frames are large enough (~600 KB) that a cloud (WebRTC) connection can
+# drop or truncate one - and a drop tears down the whole gRPC channel, which the
+# SDK then rebuilds in the background. Retrying before that rebuild lands just
+# hits a dead socket, so on failure we wait for the link to come back
+# (wait_until_connected) instead of retrying blindly. Dialing the machine
+# directly (VIAM_LOCAL_ADDRESS, see pick_and_place.py) avoids the chunking that
+# causes this in the first place; the retries stay as a safety net either way.
+RETRIES = 4
+RETRY_BACKOFF_S = 1.0        # base backoff for non-connection errors; doubles each retry
+RETRY_BACKOFF_MAX_S = 8.0    # cap on that backoff
+
+# When the link drops, poll a cheap round-trip until it succeeds (channel is
+# back) or the timeout elapses. The default health check only fires every 10s,
+# so allow comfortably longer than that before giving up on the cycle.
+RECONNECT_WAIT_S = 30.0
+RECONNECT_POLL_S = 1.5
+RECONNECT_PROBE_TIMEOUT_S = 5.0
 
 
-async def with_retries(make_coro, what: str):
-    """Await make_coro(), retrying on transient failures (e.g. dropped frames)."""
+async def wait_until_connected(machine, timeout_s: float = RECONNECT_WAIT_S) -> bool:
+    """Poll until the machine's link is usable again, or the timeout elapses.
+
+    A dropped frame makes the SDK tear down and rebuild the gRPC channel in the
+    background. refresh() round-trips a cheap ResourceNames call: it fails while
+    the channel is down and succeeds once the rebuild lands, so polling it lets
+    us retry the heavy call only after the socket is actually back.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            await asyncio.wait_for(machine.refresh(), timeout=RECONNECT_PROBE_TIMEOUT_S)
+            return True
+        except Exception as exc:  # noqa: BLE001 - keep polling until the deadline
+            if time.monotonic() >= deadline:
+                LOGGER.warning(
+                    "Link still down after %.0fs (%s); giving up this cycle",
+                    timeout_s, type(exc).__name__,
+                )
+                return False
+            LOGGER.info("Waiting for the machine to reconnect...")
+            await asyncio.sleep(RECONNECT_POLL_S)
+
+
+async def with_retries(make_coro, what: str, *, recover=None):
+    """Await make_coro(), retrying on transient failures (e.g. dropped frames).
+
+    Between attempts, if `recover` is given it is awaited - used to wait for a
+    dropped link to reconnect before retrying against a dead socket - otherwise
+    we back off exponentially. The last error is re-raised if every attempt fails.
+    """
     last = None
+    backoff = RETRY_BACKOFF_S
     for attempt in range(1, RETRIES + 1):
         try:
             return await make_coro()
@@ -98,7 +146,11 @@ async def with_retries(make_coro, what: str):
                 "%s failed (attempt %d/%d): %s", what, attempt, RETRIES, type(exc).__name__
             )
             if attempt < RETRIES:
-                await asyncio.sleep(RETRY_DELAY_S)
+                if recover is not None:
+                    await recover()
+                else:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, RETRY_BACKOFF_MAX_S)
     raise last
 
 
@@ -140,9 +192,16 @@ def sample_depth(depth_arr, u: int, v: int, half: int = DEPTH_WINDOW_HALF):
 
 async def compute_pick_pose(machine, camera: Camera, vision: VisionClient):
     """Detect the target and return (pick_pose, detection), or raise on failure."""
+
+    async def reconnect():
+        # Between retries, wait for the machine's link to come back rather than
+        # hammering a socket the SDK has torn down for a background reconnect.
+        await wait_until_connected(machine)
+
     detections = await with_retries(
         lambda: vision.get_detections_from_camera(CAMERA_NAME, timeout=25),
         "get_detections_from_camera",
+        recover=reconnect,
     )
     LOGGER.info("Detector returned %d detection(s)", len(detections))
     det = select_detection(detections, TARGET_CLASS, MIN_CONFIDENCE)
@@ -159,13 +218,25 @@ async def compute_pick_pose(machine, camera: Camera, vision: VisionClient):
         det.class_name, det.confidence, det.x_min, det.y_min, det.x_max, det.y_max, u, v,
     )
 
-    props = await with_retries(lambda: camera.get_properties(), "get_properties")
+    props = await with_retries(
+        lambda: camera.get_properties(), "get_properties", recover=reconnect
+    )
     intr = props.intrinsic_parameters
 
-    images, _ = await with_retries(lambda: camera.get_images(timeout=25), "get_images")
-    depth_img = next((i for i in images if i.name == "depth"), None)
+    # Depth only: the color frame doubles the payload and we never use it.
+    images, _ = await with_retries(
+        lambda: camera.get_images(filter_source_names=[DEPTH_SOURCE], timeout=25),
+        "get_images(depth-only)",
+        recover=reconnect,
+    )
+    depth_img = next((i for i in images if i.name == DEPTH_SOURCE), None)
     if depth_img is None:
-        raise RuntimeError("Camera returned no depth image; is it an RGBD camera?")
+        got = ", ".join(i.name for i in images) or "none"
+        raise RuntimeError(
+            f"Camera returned no '{DEPTH_SOURCE}' image (got: {got}); is it an "
+            "RGBD camera? Set VIAM_DEPTH_SOURCE if the depth stream is named "
+            "differently."
+        )
     depth_arr = depth_img.bytes_to_depth_array()
 
     z_mm = sample_depth(depth_arr, u, v)
@@ -186,7 +257,9 @@ async def compute_pick_pose(machine, camera: Camera, vision: VisionClient):
         pose=Pose(x=cam_x, y=cam_y, z=cam_z, o_x=0.0, o_y=0.0, o_z=-1.0, theta=0.0),
     )
     dest_pif = await with_retries(
-        lambda: machine.transform_pose(cam_pif, DEST_FRAME), "transform_pose"
+        lambda: machine.transform_pose(cam_pif, DEST_FRAME),
+        "transform_pose",
+        recover=reconnect,
     )
     p = dest_pif.pose
     LOGGER.info("Object in '%s' frame: x=%.1f y=%.1f z=%.1f", DEST_FRAME, p.x, p.y, p.z)
@@ -200,7 +273,7 @@ async def compute_pick_pose(machine, camera: Camera, vision: VisionClient):
 
 
 async def main() -> None:
-    machine = await RobotClient.at_address(MACHINE_ADDRESS, connect_options())
+    machine = await connect()
     try:
         LOGGER.info("Connected. Target class: %r (min conf %.2f)", TARGET_CLASS or "<any>", MIN_CONFIDENCE)
         camera = Camera.from_robot(machine, CAMERA_NAME)
