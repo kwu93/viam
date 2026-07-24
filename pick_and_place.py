@@ -58,9 +58,16 @@ START_HEIGHT = 200.0
 PLACE_LEFT_OFFSET = 25.0  # +y = left in the arm base frame; flip to -25.0 if
 # the arm moves the wrong direction
 
-# PICK is your measured grasp point. Everything else is derived from it so the
-# relationships stay correct if you edit PICK.
-PICK_POSE = Pose(x=472.0814, y=7.3932, z=214.7491, **GRASP)
+# Pauses (seconds) around the grab so the object is not disturbed mid-grasp:
+# SETTLE lets the arm come fully to rest before the gripper closes; CLAMP lets
+# the gripper finish clamping before the arm lifts. Increase if it still slips.
+SETTLE_SECONDS = 1.0
+CLAMP_SECONDS = 1.5
+
+# PICK is your measured grasp point (z 214.7491), lowered 2 mm so the gripper
+# reaches down far enough to grab the object. Everything else is derived from
+# PICK, so START and PLACE follow this height automatically.
+PICK_POSE = Pose(x=472.0814, y=7.3932, z=212.7491, **GRASP)
 # Waypoint directly above PICK: both the start position and the lift target.
 START_POSE = Pose(x=PICK_POSE.x, y=PICK_POSE.y, z=PICK_POSE.z + START_HEIGHT, **GRASP)
 # Drop location, 25 mm to the left of PICK at the same height.
@@ -109,10 +116,19 @@ async def pick_and_place(arm: Arm, gripper: Gripper) -> None:
     await move_to(arm, START_POSE, "START (above pick)")
     await move_to(arm, PICK_POSE, "PICK")
 
+    # Let the arm come fully to rest before closing, so it is not still moving
+    # when the gripper tries to grasp the object.
+    LOGGER.info("Settling %.1fs before grabbing", SETTLE_SECONDS)
+    await asyncio.sleep(SETTLE_SECONDS)
+
     LOGGER.info("Closing gripper to grab the object")
     grabbed = await gripper.grab()
     if not grabbed:
         LOGGER.warning("Gripper did not report a successful grab")
+
+    # Hold at the pick location to let the gripper finish clamping before lifting.
+    LOGGER.info("Holding %.1fs for the gripper to clamp", CLAMP_SECONDS)
+    await asyncio.sleep(CLAMP_SECONDS)
 
     # Lift straight up so the object clears the surface before moving sideways.
     await move_to(arm, START_POSE, "LIFT (above pick)")
